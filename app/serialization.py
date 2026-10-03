@@ -34,8 +34,16 @@ def run_to_dict(run: Run) -> dict:
         "version": run.version,
         "idempotency_key": run.idempotency_key,
         "state": run.state.value,
+        "reason": run.reason,
         "created_at": run.created_at,
+        "started_at": run.started_at,
         "finished_at": run.finished_at,
+        "timeout_seconds": run.timeout_seconds,
+        "duration_seconds": (
+            run.finished_at - (run.started_at or run.created_at)
+            if run.finished_at is not None
+            else None
+        ),
         "tasks": {name: task_to_dict(task) for name, task in sorted(run.tasks.items())},
     }
 
@@ -46,6 +54,7 @@ def task_def_to_dict(task: TaskDef) -> dict:
         "dependencies": list(task.dependencies),
         "action": dict(task.action),
         "max_retries": task.max_retries,
+        "timeout_seconds": task.timeout_seconds,
     }
 
 

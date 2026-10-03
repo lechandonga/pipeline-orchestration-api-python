@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import logging
+import os
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from .errors import OrchestrationError
 from .executor import LocalExecutor
-from .orchestrator import Orchestrator
+from .models import RunState
+from .orchestrator import Orchestrator, RunQuery
 from .serialization import definition_to_dict, run_to_dict
 from .validation import DefinitionRegistry
 
@@ -19,6 +21,7 @@ log = logging.getLogger("api")
 class StartRunRequest(BaseModel):
     version: int | None = Field(default=None, ge=1)
     idempotency_key: str | None = Field(default=None, min_length=1)
+    timeout_seconds: float | None = Field(default=None, gt=0)
     wait: bool = False
     wait_timeout: float | None = Field(default=None, ge=0)
 
@@ -42,9 +45,20 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    orchestrator = Orchestrator(app.state.registry, app.state.executor)
+    max_concurrent = int(os.environ.get("MAX_CONCURRENT_RUNS", "8"))
+    max_workers = int(os.environ.get("MAX_TASK_WORKERS", "64"))
+    orchestrator = Orchestrator(
+        app.state.registry,
+        app.state.executor,
+        max_workers=max_workers,
+        max_concurrent_runs=max_concurrent,
+    )
     app.state.orchestrator = orchestrator
-    log.info("orchestration service started")
+    log.info(
+        "orchestration service started max_concurrent_runs=%d max_workers=%d",
+        max_concurrent,
+        max_workers,
+    )
     try:
         yield
     finally:
@@ -114,6 +128,7 @@ def _register_routes(app: FastAPI) -> None:
                 name,
                 version=body.version,
                 idempotency_key=body.idempotency_key,
+                timeout_seconds=body.timeout_seconds,
             )
             if body.wait:
                 run = _orch(request).wait_for(run.run_id, body.wait_timeout)
@@ -123,6 +138,15 @@ def _register_routes(app: FastAPI) -> None:
         result["created"] = created
         return result
 
+    @app.get("/runs/stats")
+    def run_stats(
+        request: Request,
+        pipeline: str | None = None,
+        created_from: float | None = Query(default=None),
+        created_to: float | None = Query(default=None),
+    ):
+        return _orch(request).run_stats(pipeline, created_from, created_to)
+
     @app.get("/runs/{run_id}")
     def get_run(request: Request, run_id: str):
         try:
@@ -131,10 +155,41 @@ def _register_routes(app: FastAPI) -> None:
             _raise(exc)
         return run_to_dict(run)
 
+
     @app.get("/runs")
-    def list_runs(request: Request, pipeline: str | None = None):
-        runs = _orch(request).list_runs(pipeline)
-        return {"runs": [run_to_dict(r) for r in runs]}
+    def list_runs(
+        request: Request,
+        pipeline: str | None = None,
+        state: str | None = None,
+        created_from: float | None = Query(default=None),
+        created_to: float | None = Query(default=None),
+        limit: int = Query(default=50, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+    ):
+        if state is not None:
+            state = state.strip().upper()
+            valid = {s.value for s in RunState}
+            if state not in valid:
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": "INVALID_STATE", "message": f"unknown state '{state}'"},
+                )
+        page = _orch(request).query_runs(
+            RunQuery(
+                pipeline_name=pipeline,
+                state=state,
+                created_from=created_from,
+                created_to=created_to,
+                limit=limit,
+                offset=offset,
+            )
+        )
+        return {
+            "runs": [run_to_dict(r) for r in page.runs],
+            "total": page.total,
+            "limit": page.limit,
+            "offset": page.offset,
+        }
 
     @app.post("/runs/{run_id}/wait")
     def wait_run(

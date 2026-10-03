@@ -87,6 +87,17 @@ def _validate_retry(value: object, where: str) -> int:
     return value
 
 
+def _validate_timeout(value: object, where: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise InvalidActionError(
+            f"'{where}' must be a positive number of seconds",
+            details={"where": where},
+        )
+    return float(value)
+
+
 def build_definition(payload: dict, version: int) -> PipelineDef:
     if not isinstance(payload, dict):
         raise EmptyDefinitionError("pipeline definition must be an object")
@@ -125,6 +136,9 @@ def build_definition(payload: dict, version: int) -> PipelineDef:
                 details={"task": task_name},
             )
         action = _validate_action(task_name, raw.get("action"))
+        task_timeout = _validate_timeout(
+            raw.get("timeout_seconds"), f"tasks[{index}].timeout_seconds"
+        )
         raw_task_retries = raw.get("max_retries")
         task_retries = (
             None
@@ -139,6 +153,7 @@ def build_definition(payload: dict, version: int) -> PipelineDef:
             dependencies=list(deps),
             action=action,
             max_retries=(default_retries if task_retries is None else task_retries),
+            timeout_seconds=task_timeout,
         )
     if duplicates:
         raise DuplicateTaskError(
@@ -215,14 +230,18 @@ class DefinitionRegistry:
     def submit(self, payload: dict) -> SubmissionResult:
         name = payload.get("name")
         with self._lock:
-            existing = self._versions.get(name, []) if isinstance(name, str) else []
+            lookup = name.strip() if isinstance(name, str) else name
+            existing = self._versions.get(lookup, [])
             candidate = build_definition(payload, version=len(existing) + 1)
-            if existing and self._same_graph(existing[-1], candidate):
+            match = next(
+                (v for v in existing if self._same_graph(v, candidate)), None
+            )
+            if match is not None:
                 return SubmissionResult(
-                    name=name,
-                    version=existing[-1].version,
+                    name=candidate.name,
+                    version=match.version,
                     reused=True,
-                    definition=existing[-1],
+                    definition=match,
                 )
             self._versions.setdefault(candidate.name, []).append(candidate)
             return SubmissionResult(
@@ -244,13 +263,15 @@ class DefinitionRegistry:
                 return False
             if task_a.max_retries != task_b.max_retries:
                 return False
+            if task_a.timeout_seconds != task_b.timeout_seconds:
+                return False
             if task_a.action != task_b.action:
                 return False
         return True
 
     def get(self, name: str, version: int | None = None) -> PipelineDef:
         with self._lock:
-            versions = self._versions.get(name)
+            versions = self._versions.get(name.strip() if isinstance(name, str) else name)
             if not versions:
                 raise PipelineNotFoundError(
                     f"pipeline '{name}' is not defined",
@@ -271,7 +292,9 @@ class DefinitionRegistry:
 
     def list_versions(self, name: str) -> list[PipelineDef]:
         with self._lock:
-            versions = self._versions.get(name)
+            versions = self._versions.get(
+                name.strip() if isinstance(name, str) else name
+            )
             if not versions:
                 raise PipelineNotFoundError(
                     f"pipeline '{name}' is not defined",

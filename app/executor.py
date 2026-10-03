@@ -29,6 +29,9 @@ class ExecutionContext:
     task_name: str
     attempt: int
     cancel_event: threading.Event
+    # Set when this specific attempt must give up (task timeout) or when the
+    # whole run is being torn down (cancel / run-level timeout).
+    deadline_event: threading.Event | None = None
 
 
 class LocalExecutor:
@@ -58,7 +61,7 @@ class LocalExecutor:
         if action_type == "flaky":
             threshold = action.get("succeed_on_attempt", 1)
             seconds = action.get("seconds", 0.0)
-            self._interruptible_sleep(seconds, ctx.cancel_event)
+            self._interruptible_sleep(seconds, ctx.cancel_event, ctx.deadline_event)
             if ctx.attempt < threshold:
                 raise TaskFailure(
                     action.get(
@@ -68,14 +71,30 @@ class LocalExecutor:
                 )
             return
         if action_type == "sleep":
-            self._interruptible_sleep(action.get("seconds", 0.05), ctx.cancel_event)
+            self._interruptible_sleep(
+                action.get("seconds", 0.05), ctx.cancel_event, ctx.deadline_event
+            )
             return
         raise TaskFailure(f"unknown action type '{action_type}'")
 
     @staticmethod
-    def _interruptible_sleep(seconds: float, cancel_event: threading.Event) -> None:
-        if cancel_event.wait(timeout=max(0.0, float(seconds))):
+    def _interruptible_sleep(
+        seconds: float,
+        cancel_event: threading.Event,
+        deadline_event: threading.Event | None = None,
+    ) -> None:
+        deadline = max(0.0, float(seconds))
+        interval = 0.02
+        while deadline > 0:
+            if cancel_event.wait(timeout=min(interval, deadline)):
+                raise TaskFailure("interrupted by cancellation")
+            if deadline_event is not None and deadline_event.is_set():
+                raise TaskFailure("interrupted: attempt timed out")
+            deadline -= interval
+        if cancel_event.is_set():
             raise TaskFailure("interrupted by cancellation")
+        if deadline_event is not None and deadline_event.is_set():
+            raise TaskFailure("interrupted: attempt timed out")
 
 
 def now() -> float:
