@@ -35,7 +35,13 @@ def run_to_dict(run: Run) -> dict:
         "idempotency_key": run.idempotency_key,
         "state": run.state.value,
         "created_at": run.created_at,
+        "started_at": run.started_at,
         "finished_at": run.finished_at,
+        "queued_at": run.wall_created_at,
+        "wall_started_at": run.wall_started_at,
+        "wall_finished_at": run.wall_finished_at,
+        "timeout_seconds": run.timeout_seconds,
+        "failure_reason": run.failure_reason,
         "tasks": {name: task_to_dict(task) for name, task in sorted(run.tasks.items())},
     }
 
@@ -46,6 +52,7 @@ def task_def_to_dict(task: TaskDef) -> dict:
         "dependencies": list(task.dependencies),
         "action": dict(task.action),
         "max_retries": task.max_retries,
+        "timeout_seconds": task.timeout_seconds,
     }
 
 
@@ -54,6 +61,7 @@ def definition_to_dict(definition: PipelineDef) -> dict:
         "name": definition.name,
         "version": definition.version,
         "default_max_retries": definition.default_max_retries,
+        "default_task_timeout_seconds": definition.default_task_timeout_seconds,
         "created_at": definition.created_at,
         "tasks": [
             task_def_to_dict(definition.tasks[name])

@@ -87,6 +87,28 @@ def _validate_retry(value: object, where: str) -> int:
     return value
 
 
+def _validate_timeout(value: object, where: str) -> float | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or value <= 0
+    ):
+        raise InvalidActionError(
+            f"'{where}' must be a positive number of seconds",
+            details={"where": where},
+        )
+    return float(value)
+
+
+def normalize_name(name: object) -> str:
+    """Trim surrounding whitespace; 'etl ' and ' etl' are the same pipeline."""
+    if isinstance(name, str):
+        return name.strip()
+    return name  # type: ignore[return-value]
+
+
 def build_definition(payload: dict, version: int) -> PipelineDef:
     if not isinstance(payload, dict):
         raise EmptyDefinitionError("pipeline definition must be an object")
@@ -102,6 +124,10 @@ def build_definition(payload: dict, version: int) -> PipelineDef:
 
     default_retries = _validate_retry(
         payload.get("default_max_retries", 0), "default_max_retries"
+    )
+    default_timeout = _validate_timeout(
+        payload.get("default_task_timeout_seconds"),
+        "default_task_timeout_seconds",
     )
 
     seen: set[str] = set()
@@ -131,6 +157,14 @@ def build_definition(payload: dict, version: int) -> PipelineDef:
             if raw_task_retries is None
             else _validate_retry(raw_task_retries, f"tasks[{index}].max_retries")
         )
+        raw_task_timeout = raw.get("timeout_seconds")
+        task_timeout = (
+            default_timeout
+            if raw_task_timeout is None
+            else _validate_timeout(
+                raw_task_timeout, f"tasks[{index}].timeout_seconds"
+            )
+        )
         if task_name in seen:
             duplicates.append(task_name)
         seen.add(task_name)
@@ -139,6 +173,7 @@ def build_definition(payload: dict, version: int) -> PipelineDef:
             dependencies=list(deps),
             action=action,
             max_retries=(default_retries if task_retries is None else task_retries),
+            timeout_seconds=task_timeout,
         )
     if duplicates:
         raise DuplicateTaskError(
@@ -169,6 +204,7 @@ def build_definition(payload: dict, version: int) -> PipelineDef:
         name=name.strip(),
         version=version,
         default_max_retries=default_retries,
+        default_task_timeout_seconds=default_timeout,
         tasks=tasks,
     )
 
@@ -213,13 +249,17 @@ class DefinitionRegistry:
         self._versions: dict[str, list[PipelineDef]] = {}
 
     def submit(self, payload: dict) -> SubmissionResult:
-        name = payload.get("name")
+        name = normalize_name(payload.get("name"))
+        normalized_payload = dict(payload)
+        normalized_payload["name"] = name
         with self._lock:
-            existing = self._versions.get(name, []) if isinstance(name, str) else []
-            candidate = build_definition(payload, version=len(existing) + 1)
+            existing = self._versions.get(name, [])
+            candidate = build_definition(
+                normalized_payload, version=len(existing) + 1
+            )
             if existing and self._same_graph(existing[-1], candidate):
                 return SubmissionResult(
-                    name=name,
+                    name=candidate.name,
                     version=existing[-1].version,
                     reused=True,
                     definition=existing[-1],
@@ -236,6 +276,8 @@ class DefinitionRegistry:
     def _same_graph(a: PipelineDef, b: PipelineDef) -> bool:
         if a.default_max_retries != b.default_max_retries:
             return False
+        if a.default_task_timeout_seconds != b.default_task_timeout_seconds:
+            return False
         if set(a.tasks) != set(b.tasks):
             return False
         for task_name, task_a in a.tasks.items():
@@ -244,11 +286,14 @@ class DefinitionRegistry:
                 return False
             if task_a.max_retries != task_b.max_retries:
                 return False
+            if task_a.timeout_seconds != task_b.timeout_seconds:
+                return False
             if task_a.action != task_b.action:
                 return False
         return True
 
     def get(self, name: str, version: int | None = None) -> PipelineDef:
+        name = normalize_name(name)
         with self._lock:
             versions = self._versions.get(name)
             if not versions:
@@ -270,6 +315,7 @@ class DefinitionRegistry:
             return versions[version - 1]
 
     def list_versions(self, name: str) -> list[PipelineDef]:
+        name = normalize_name(name)
         with self._lock:
             versions = self._versions.get(name)
             if not versions:

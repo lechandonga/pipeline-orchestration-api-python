@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import logging
+import os
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from .errors import OrchestrationError
+from .errors import InvalidQueryError, OrchestrationError
 from .executor import LocalExecutor
 from .orchestrator import Orchestrator
 from .serialization import definition_to_dict, run_to_dict
@@ -19,6 +20,7 @@ log = logging.getLogger("api")
 class StartRunRequest(BaseModel):
     version: int | None = Field(default=None, ge=1)
     idempotency_key: str | None = Field(default=None, min_length=1)
+    run_timeout_seconds: float | None = Field(default=None, gt=0)
     wait: bool = False
     wait_timeout: float | None = Field(default=None, ge=0)
 
@@ -42,7 +44,12 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    orchestrator = Orchestrator(app.state.registry, app.state.executor)
+    capacity = int(os.environ.get("PIPELINE_MAX_CONCURRENT_RUNS", "8"))
+    orchestrator = Orchestrator(
+        app.state.registry,
+        app.state.executor,
+        max_concurrent_runs=capacity,
+    )
     app.state.orchestrator = orchestrator
     log.info("orchestration service started")
     try:
@@ -68,6 +75,8 @@ def _status_for(code: str) -> int:
         return 404
     if code == "RUN_NOT_CANCELLABLE":
         return 409
+    if code == "INVALID_QUERY":
+        return 400
     return 422
 
 
@@ -104,7 +113,10 @@ def _register_routes(app: FastAPI) -> None:
             versions = _orch(request).registry.list_versions(name)
         except OrchestrationError as exc:
             _raise(exc)
-        return {"name": name, "versions": [definition_to_dict(v) for v in versions]}
+        return {
+            "name": versions[0].name,
+            "versions": [definition_to_dict(v) for v in versions],
+        }
 
     @app.post("/pipelines/{name}/runs", status_code=202)
     def start_run(request: Request, name: str, body: StartRunRequest | None):
@@ -114,6 +126,7 @@ def _register_routes(app: FastAPI) -> None:
                 name,
                 version=body.version,
                 idempotency_key=body.idempotency_key,
+                run_timeout_seconds=body.run_timeout_seconds,
             )
             if body.wait:
                 run = _orch(request).wait_for(run.run_id, body.wait_timeout)
@@ -132,9 +145,45 @@ def _register_routes(app: FastAPI) -> None:
         return run_to_dict(run)
 
     @app.get("/runs")
-    def list_runs(request: Request, pipeline: str | None = None):
-        runs = _orch(request).list_runs(pipeline)
-        return {"runs": [run_to_dict(r) for r in runs]}
+    def list_runs(
+        request: Request,
+        pipeline: str | None = None,
+        state: str | None = None,
+        start_time: float | None = Query(default=None, ge=0),
+        end_time: float | None = Query(default=None, ge=0),
+        limit: int = Query(default=50, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+    ):
+        try:
+            runs, total = _orch(request).query_runs(
+                pipeline_name=pipeline,
+                state=state,
+                start_time=start_time,
+                end_time=end_time,
+                limit=limit,
+                offset=offset,
+            )
+        except InvalidQueryError as exc:
+            _raise(exc)
+        return {
+            "runs": [run_to_dict(r) for r in runs],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
+    @app.get("/runs-stats")
+    def runs_stats(
+        request: Request,
+        pipeline: str | None = None,
+        start_time: float | None = Query(default=None, ge=0),
+        end_time: float | None = Query(default=None, ge=0),
+    ):
+        return _orch(request).run_stats(
+            pipeline_name=pipeline,
+            start_time=start_time,
+            end_time=end_time,
+        )
 
     @app.post("/runs/{run_id}/wait")
     def wait_run(

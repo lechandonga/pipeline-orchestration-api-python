@@ -1,16 +1,24 @@
-"""Run scheduling, idempotency, cancellation and retry propagation."""
+"""Run admission, scheduling, timeouts, idempotency and retry propagation."""
 
 from __future__ import annotations
 
+import collections
 import logging
 import threading
-from concurrent.futures import Future, ThreadPoolExecutor
+import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 
 from .errors import (
     RunNotCancellableError,
     RunNotFoundError,
 )
-from .executor import ExecutionContext, LocalExecutor, TaskFailure, now
+from .executor import (
+    ExecutionContext,
+    LocalExecutor,
+    TaskFailure,
+    TaskTimeoutError,
+    now,
+)
 from .models import (
     AttemptRecord,
     PipelineDef,
@@ -30,27 +38,59 @@ _TERMINAL_TASK_STATES = {
     TaskState.CANCELLED,
 }
 
+_TERMINAL_RUN_STATES = {
+    RunState.SUCCEEDED,
+    RunState.FAILED,
+    RunState.CANCELLED,
+}
+
 
 class Orchestrator:
     def __init__(
         self,
         registry: DefinitionRegistry,
         executor: LocalExecutor | None = None,
-        max_workers: int = 16,
+        max_concurrent_runs: int = 8,
+        max_task_workers: int | None = None,
     ) -> None:
         self.registry = registry
         self.executor = executor or LocalExecutor()
-        self._pool = ThreadPoolExecutor(
-            max_workers=max_workers, thread_name_prefix="pipe-task"
+        if max_concurrent_runs < 1:
+            raise ValueError("max_concurrent_runs must be >= 1")
+        self.max_concurrent_runs = max_concurrent_runs
+        # One scheduler future per admitted run, plus task workers. Capacity is
+        # enforced by admission, so the task pool only needs to be large enough
+        # that admitted runs never block each other: worst case every run fans
+        # out; cap the headroom to keep threads bounded.
+        max_task_workers = max_task_workers or min(64, max(16, max_concurrent_runs * 8))
+        self._sched_pool = ThreadPoolExecutor(
+            max_workers=max_concurrent_runs, thread_name_prefix="pipe-run"
+        )
+        self._task_pool = ThreadPoolExecutor(
+            max_workers=max_task_workers, thread_name_prefix="pipe-task"
         )
         self._runs: dict[str, Run] = {}
         # (pipeline, idempotency_key) -> run_id; a run owns its key forever,
         # including after it finishes, so late re-triggers return the result.
         self._idempotency: dict[tuple[str, str], str] = {}
         self._lock = threading.RLock()
+        # Admission control: FIFO queue of (run, definition snapshot) waiting.
+        self._queue: collections.deque[tuple[Run, PipelineDef]] = collections.deque()
+        self._active = 0
+        self._admission_cond = threading.Condition(self._lock)
+        self._sequence = 0
+        self._stopping = False
+        self._dispatcher = threading.Thread(
+            target=self._admit_loop, name="pipe-admit", daemon=True
+        )
+        self._dispatcher.start()
 
     def shutdown(self) -> None:
-        self._pool.shutdown(wait=True, cancel_futures=False)
+        with self._admission_cond:
+            self._stopping = True
+            self._admission_cond.notify_all()
+        self._sched_pool.shutdown(wait=True, cancel_futures=False)
+        self._task_pool.shutdown(wait=True, cancel_futures=False)
 
     # ------------------------------------------------------------------ runs
     def start_run(
@@ -59,11 +99,16 @@ class Orchestrator:
         *,
         version: int | None = None,
         idempotency_key: str | None = None,
+        run_timeout_seconds: float | None = None,
     ) -> tuple[Run, bool]:
         """Start (or return the existing run for) a pipeline run.
 
         Returns ``(run, created)``. The definition snapshot is captured here,
         so later submissions of new versions never affect this run.
+
+        New runs enter QUEUED and start in trigger order once capacity frees
+        up; ``run_timeout_seconds`` bounds the whole run from the moment it is
+        admitted out of the queue.
         """
         definition = self.registry.get(pipeline_name, version)
         with self._lock:
@@ -80,19 +125,69 @@ class Orchestrator:
                     )
                     return existing, False
             run = Run.new(definition, idempotency_key)
+            run.timeout_seconds = run_timeout_seconds
+            self._sequence += 1
+            run.sequence = self._sequence
             self._runs[run.run_id] = run
             if idempotency_key is not None:
                 self._idempotency[(definition.name, idempotency_key)] = run.run_id
+            self._queue.append((run, definition))
+            self._admission_cond.notify()
         log.info(
-            "run created pipeline=%s version=%d run=%s tasks=%d key=%s",
+            "run queued pipeline=%s version=%d run=%s tasks=%d key=%s",
             run.pipeline_name,
             run.version,
             run.run_id,
             len(run.tasks),
             idempotency_key,
         )
-        self._pool.submit(self._schedule, run, definition)
         return run, True
+
+    # --------------------------------------------------------- admission gate
+    def _admit_loop(self) -> None:
+        while True:
+            admitted: list[tuple[Run, PipelineDef]] = []
+            with self._admission_cond:
+                while not self._stopping and not (
+                    self._queue and self._active < self.max_concurrent_runs
+                ):
+                    self._admission_cond.wait(timeout=0.1)
+                    if self._stopping:
+                        break
+                if self._stopping:
+                    return
+                while self._queue and self._active < self.max_concurrent_runs:
+                    run, definition = self._queue.popleft()
+                    # A run can leave the queue only by admission or by being
+                    # cancelled while queued (which removes it explicitly);
+                    # guard anyway so a stale entry never steals a slot.
+                    if run.state != RunState.QUEUED:
+                        continue
+                    self._active += 1
+                    admitted.append((run, definition))
+            for run, definition in admitted:
+                self._mark_admitted(run)
+                if run.state == RunState.RUNNING:
+                    self._sched_pool.submit(self._schedule, run, definition)
+                else:
+                    # Cancelled in the tiny window between selection and the
+                    # state flip: it never owned a scheduler slot.
+                    self._release_slot()
+
+    @staticmethod
+    def _mark_admitted(run: Run) -> None:
+        with run.cond:
+            if run.state != RunState.QUEUED:
+                return
+            run.state = RunState.RUNNING
+            run.started_at = now()
+            run.wall_started_at = time.time()
+            run.cond.notify_all()
+
+    def _release_slot(self) -> None:
+        with self._admission_cond:
+            self._active -= 1
+            self._admission_cond.notify()
 
     def get_run(self, run_id: str) -> Run:
         with self._lock:
@@ -110,46 +205,209 @@ class Orchestrator:
             runs = [r for r in runs if r.pipeline_name == pipeline_name]
         return runs
 
+    def query_runs(
+        self,
+        *,
+        pipeline_name: str | None = None,
+        state: str | None = None,
+        start_time: float | None = None,
+        end_time: float | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[Run], int]:
+        """Filtered, paginated history ordered by trigger sequence.
+
+        Filtering, total counting and paging happen on one consistent
+        snapshot, so a page can never duplicate or drop a run. Detached
+        copies are returned, so serialization never blocks live scheduling.
+        """
+        states = self._parse_states(state)
+        with self._lock:
+            matched = [
+                run
+                for run in self._runs.values()
+                if self._matches(
+                    run, pipeline_name, states, start_time, end_time
+                )
+            ]
+            matched.sort(key=lambda r: (r.sequence, r.run_id))
+            total = len(matched)
+            page = matched[offset : offset + limit]
+        return [run.snapshot() for run in page], total
+
+    def run_stats(
+        self,
+        *,
+        pipeline_name: str | None = None,
+        start_time: float | None = None,
+        end_time: float | None = None,
+    ) -> dict:
+        """Per-state counts plus queue depth and average finished duration.
+
+        Uses the same filters (minus state) as ``query_runs`` so statistics
+        and listed details always reconcile.
+        """
+        counts = {s.value: 0 for s in RunState}
+        durations: list[float] = []
+        with self._lock:
+            for run in list(self._runs.values()):
+                if pipeline_name is not None and run.pipeline_name != pipeline_name:
+                    continue
+                if start_time is not None and run.wall_created_at < start_time:
+                    continue
+                if end_time is not None and run.wall_created_at > end_time:
+                    continue
+                counts[run.state.value] += 1
+                if (
+                    run.state in _TERMINAL_RUN_STATES
+                    and run.wall_started_at is not None
+                    and run.wall_finished_at is not None
+                ):
+                    durations.append(
+                        run.wall_finished_at - run.wall_started_at
+                    )
+        finished = (
+            counts[RunState.SUCCEEDED.value]
+            + counts[RunState.FAILED.value]
+            + counts[RunState.CANCELLED.value]
+        )
+        return {
+            "states": counts,
+            "total": sum(counts.values()),
+            "queued": counts[RunState.QUEUED.value],
+            "running": counts[RunState.RUNNING.value],
+            "finished": finished,
+            "average_duration_seconds": (
+                sum(durations) / len(durations) if durations else None
+            ),
+        }
+
+    @staticmethod
+    def _parse_states(state: str | None) -> set[RunState] | None:
+        if state is None:
+            return None
+        names = {p.strip().upper() for p in state.split(",") if p.strip()}
+        invalid = names - {s.value for s in RunState}
+        if invalid:
+            from .errors import InvalidQueryError
+
+            raise InvalidQueryError(
+                f"unknown run state filter: {', '.join(sorted(invalid))}",
+                details={"invalid": sorted(invalid)},
+            )
+        return {RunState(n) for n in names}
+
+    @staticmethod
+    def _matches(
+        run: Run,
+        pipeline_name: str | None,
+        states: set[RunState] | None,
+        start_time: float | None,
+        end_time: float | None,
+    ) -> bool:
+        if pipeline_name is not None and run.pipeline_name != pipeline_name:
+            return False
+        if states is not None and run.state not in states:
+            return False
+        if start_time is not None and run.wall_created_at < start_time:
+            return False
+        if end_time is not None and run.wall_created_at > end_time:
+            return False
+        return True
+
     def wait_for(self, run_id: str, timeout: float | None = None) -> Run:
         run = self.get_run(run_id)
         with run.cond:
-            if run.state == RunState.RUNNING:
+            if run.state not in _TERMINAL_RUN_STATES:
                 run.cond.wait_for(
-                    lambda: run.state != RunState.RUNNING, timeout=timeout
+                    lambda: run.state in _TERMINAL_RUN_STATES, timeout=timeout
                 )
         return run
 
     # ------------------------------------------------------------ cancellation
     def cancel_run(self, run_id: str) -> Run:
         run = self.get_run(run_id)
+        queued = False
+        with self._lock:
+            if run.state == RunState.QUEUED:
+                for item in list(self._queue):
+                    if item[0] is run:
+                        self._queue.remove(item)
+                        queued = True
+                        break
+        self._abort_run(
+            run,
+            RunState.CANCELLED,
+            "cancelled while queued: no task was started" if queued
+            else "run cancelled",
+        )
+        log.info("run cancelled run=%s queued=%s", run_id, queued)
+        return run
+
+    def _abort_run(self, run: Run, final_state: RunState, reason: str) -> None:
+        """Move a QUEUED/RUNNING run to a terminal state and converge tasks."""
         with run.cond:
-            if run.state != RunState.RUNNING:
+            if run.state in _TERMINAL_RUN_STATES:
                 raise RunNotCancellableError(
                     f"run is already in terminal state {run.state.value}",
-                    details={"run_id": run_id, "state": run.state.value},
+                    details={"run_id": run.run_id, "state": run.state.value},
                 )
-            run.state = RunState.CANCELLED
+            from_queue = run.state == RunState.QUEUED
+            run.state = final_state
+            run.failure_reason = reason
             run.cancel_event.set()
             for task in run.tasks.values():
                 if task.state == TaskState.PENDING:
                     task.state = TaskState.SKIPPED
-                    task.error = "skipped: run cancelled before start"
+                    task.error = (
+                        "skipped: run cancelled while queued"
+                        if from_queue
+                        else f"skipped: run {final_state.value.lower()} before start"
+                    )
                     task.finished_at = now()
-            run.finished_at = now()
+            if from_queue:
+                run.started_at = None
+                run.wall_started_at = None
+                run.finished_at = None
+            else:
+                run.finished_at = now()
+            run.wall_finished_at = time.time()
             run.cond.notify_all()
-        log.info("run cancelled run=%s", run_id)
-        return run
+        if from_queue:
+            with self._admission_cond:
+                self._admission_cond.notify()
+
+    def _on_run_timeout(self, run: Run) -> None:
+        with run.cond:
+            if run.state != RunState.RUNNING:
+                return
+            seconds = run.timeout_seconds
+            reason = (
+                f"run exceeded timeout of {seconds:.3f}s"
+                if seconds is not None
+                else "run timed out"
+            )
+        self._abort_run(run, RunState.FAILED, reason)
+        log.warning("run timed out run=%s", run.run_id)
 
     # -------------------------------------------------------------- scheduling
     def _schedule(self, run: Run, definition: PipelineDef) -> None:
         in_flight: dict[str, Future] = {}
         remaining = set(definition.tasks)
+        timer: threading.Timer | None = None
+
+        if run.timeout_seconds is not None and run.state == RunState.RUNNING:
+            timer = threading.Timer(
+                run.timeout_seconds, self._on_run_timeout, args=(run,)
+            )
+            timer.daemon = True
+            timer.start()
 
         try:
             while True:
                 ready: list[TaskDef] = []
                 with run.cond:
-                    if run.state == RunState.CANCELLED:
+                    if run.state != RunState.RUNNING:
                         break
                     failed = any(
                         t.state == TaskState.FAILED for t in run.tasks.values()
@@ -163,9 +421,7 @@ class Orchestrator:
                             task.state in _TERMINAL_TASK_STATES
                             for task in run.tasks.values()
                         ):
-                            run.state = RunState.FAILED
-                            run.finished_at = now()
-                            run.cond.notify_all()
+                            self._finish_locked(run, RunState.FAILED)
                             break
                     # Launch tasks whose dependencies are settled. After a
                     # failure, propagation above has removed every blocked
@@ -179,47 +435,51 @@ class Orchestrator:
                             remaining.discard(name)
                             ready.append(task_def)
                 for task_def in ready:
-                    in_flight[task_def.name] = self._pool.submit(
+                    in_flight[task_def.name] = self._task_pool.submit(
                         self._run_task, run, definition, task_def
                     )
                 if not in_flight:
                     # Nothing running and nothing newly launched means all
                     # tasks reached a terminal state without failures.
                     break
-                done = self._wait_any(run, in_flight)
-                for name, future in done:
+                finished, _ = wait(
+                    list(in_flight.values()),
+                    timeout=0.1,
+                    return_when=FIRST_COMPLETED,
+                )
+                for future in finished:
+                    name = next(n for n, f in in_flight.items() if f is future)
                     in_flight.pop(name)
                     future.result()  # surface unexpected worker errors
-            if run.state == RunState.RUNNING:
-                with run.cond:
-                    run.state = RunState.SUCCEEDED
-                    run.finished_at = now()
-                    run.cond.notify_all()
+            with run.cond:
+                if run.state == RunState.RUNNING:
+                    self._finish_locked(run, RunState.SUCCEEDED)
         except Exception:  # pragma: no cover - defensive
             log.exception("scheduler crashed run=%s", run.run_id)
             with run.cond:
                 if run.state == RunState.RUNNING:
-                    run.state = RunState.FAILED
-                    run.finished_at = now()
-                    run.cond.notify_all()
+                    self._finish_locked(
+                        run, RunState.FAILED, "internal scheduler error"
+                    )
         finally:
+            if timer is not None:
+                timer.cancel()
             # When cancelled, in-flight tasks may still be executing; wait for
             # them to converge so status is never self-contradictory.
             for future in list(in_flight.values()):
                 future.result()
+            self._release_slot()
 
     @staticmethod
-    def _wait_any(run: Run, in_flight: dict[str, Future]) -> list[str]:
-        with run.cond:
-            while run.state == RunState.RUNNING:
-                finished = [n for n, f in in_flight.items() if f.done()]
-                if finished:
-                    return [(n, in_flight[n]) for n in finished]
-                run.cond.wait(timeout=0.05)
-                finished = [n for n, f in in_flight.items() if f.done()]
-                if finished:
-                    return [(n, in_flight[n]) for n in finished]
-        return [(n, f) for n, f in in_flight.items() if f.done()]
+    def _finish_locked(
+        run: Run, state: RunState, reason: str | None = None
+    ) -> None:
+        run.state = state
+        if reason is not None:
+            run.failure_reason = reason
+        run.finished_at = now()
+        run.wall_finished_at = time.time()
+        run.cond.notify_all()
 
     def _wait_settled(self, run: Run, timeout: float = 30.0) -> None:
         """Block until every task has converged to a terminal state."""
@@ -275,11 +535,17 @@ class Orchestrator:
                 attempt=attempt_no, status="RUNNING", started_at=now()
             )
             task.attempts.append(record)
+            deadline = (
+                now() + task_def.timeout_seconds
+                if task_def.timeout_seconds is not None
+                else None
+            )
             ctx = ExecutionContext(
                 pipeline_name=definition.name,
                 task_name=task_def.name,
                 attempt=attempt_no,
                 cancel_event=run.cancel_event,
+                deadline=deadline,
             )
             log.info(
                 "task attempt run=%s task=%s attempt=%d/%d action=%s",
@@ -291,22 +557,42 @@ class Orchestrator:
             )
             try:
                 self.executor.execute(ctx, task_def.action)
+                # An action that ignores its deadline must never look like a
+                # success: a timeout is an attempt failure, full stop.
+                if deadline is not None and now() > deadline:
+                    raise TaskTimeoutError(
+                        f"task '{task_def.name}' attempt timed out after "
+                        f"{task_def.timeout_seconds:.3f}s"
+                    )
             except TaskFailure as exc:
+                timed_out = isinstance(exc, TaskTimeoutError)
                 record.status = "FAILED"
                 record.error = str(exc)
                 record.finished_at = now()
                 last_error = str(exc)
                 log.warning(
-                    "task attempt failed run=%s task=%s attempt=%d error=%s",
+                    "task attempt %s run=%s task=%s attempt=%d error=%s",
+                    "timed out" if timed_out else "failed",
                     run.run_id,
                     task_def.name,
                     attempt_no,
                     exc,
                 )
                 with run.cond:
-                    if run.state == RunState.CANCELLED:
-                        task.state = TaskState.CANCELLED
-                        task.error = last_error
+                    # The run may have converged to a terminal state while we
+                    # were logging; re-check under the lock.
+                    aborted_state = run.state
+                    if aborted_state != RunState.RUNNING:
+                        # The run was cancelled or timed out mid-attempt.
+                        # Cancellation converges an interrupted in-flight
+                        # task to CANCELLED (historic behavior); a run-level
+                        # timeout counts as a failure, never as success.
+                        task.state = (
+                            TaskState.CANCELLED
+                            if aborted_state == RunState.CANCELLED
+                            else TaskState.FAILED
+                        )
+                        task.error = f"{run.failure_reason or 'run aborted'}: {last_error}"
                         task.finished_at = now()
                         run.cond.notify_all()
                         return
@@ -314,7 +600,14 @@ class Orchestrator:
                     continue
                 with run.cond:
                     task.state = TaskState.FAILED
-                    task.error = f"failed after {attempt_no} attempt(s): {last_error}"
+                    prefix = (
+                        "timed out"
+                        if timed_out
+                        else "failed"
+                    )
+                    task.error = (
+                        f"{prefix} after {attempt_no} attempt(s): {last_error}"
+                    )
                     task.finished_at = now()
                     run.cond.notify_all()
                 return
@@ -335,11 +628,22 @@ class Orchestrator:
                 record.status = "SUCCEEDED"
                 record.finished_at = now()
                 with run.cond:
-                    if run.state == RunState.CANCELLED:
-                        # Completed at the instant of cancellation: the work
-                        # genuinely finished, so record it but cancel the run.
-                        task.state = TaskState.CANCELLED
-                        task.error = "cancelled after last attempt finished"
+                    aborted_state = run.state
+                    if aborted_state != RunState.RUNNING:
+                        # Finished at the instant the run was aborted. Do not
+                        # book it as success against a dead run; converge to
+                        # the state matching the abort cause.
+                        record.status = "FAILED"
+                        record.error = run.failure_reason or "run aborted"
+                        record.finished_at = now()
+                        task.state = (
+                            TaskState.CANCELLED
+                            if aborted_state == RunState.CANCELLED
+                            else TaskState.FAILED
+                        )
+                        task.error = "aborted after last attempt finished: " + (
+                            run.failure_reason or "run aborted"
+                        )
                         task.finished_at = now()
                         run.cond.notify_all()
                         return

@@ -46,3 +46,7 @@ class RunNotFoundError(OrchestrationError):
 
 class RunNotCancellableError(OrchestrationError):
     code = "RUN_NOT_CANCELLABLE"
+
+
+class InvalidQueryError(OrchestrationError):
+    code = "INVALID_QUERY"

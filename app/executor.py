@@ -29,6 +29,7 @@ class ExecutionContext:
     task_name: str
     attempt: int
     cancel_event: threading.Event
+    deadline: float | None = None
 
 
 class LocalExecutor:
@@ -58,7 +59,9 @@ class LocalExecutor:
         if action_type == "flaky":
             threshold = action.get("succeed_on_attempt", 1)
             seconds = action.get("seconds", 0.0)
-            self._interruptible_sleep(seconds, ctx.cancel_event)
+            self._interruptible_sleep(
+                seconds, ctx.cancel_event, deadline=ctx.deadline
+            )
             if ctx.attempt < threshold:
                 raise TaskFailure(
                     action.get(
@@ -68,14 +71,35 @@ class LocalExecutor:
                 )
             return
         if action_type == "sleep":
-            self._interruptible_sleep(action.get("seconds", 0.05), ctx.cancel_event)
+            self._interruptible_sleep(
+                action.get("seconds", 0.05),
+                ctx.cancel_event,
+                deadline=ctx.deadline,
+            )
             return
         raise TaskFailure(f"unknown action type '{action_type}'")
 
     @staticmethod
-    def _interruptible_sleep(seconds: float, cancel_event: threading.Event) -> None:
-        if cancel_event.wait(timeout=max(0.0, float(seconds))):
+    def _interruptible_sleep(
+        seconds: float,
+        cancel_event: threading.Event,
+        *,
+        deadline: float | None = None,
+    ) -> None:
+        remaining = max(0.0, float(seconds))
+        if deadline is not None:
+            remaining = min(remaining, max(0.0, deadline - time.monotonic()))
+        if cancel_event.wait(timeout=remaining):
             raise TaskFailure("interrupted by cancellation")
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TaskTimeoutError("task attempt timed out")
+
+
+class TaskTimeoutError(TaskFailure):
+    """Raised when a task attempt exceeds its configured timeout."""
+
+    def __init__(self, message: str = "task attempt timed out") -> None:
+        super().__init__(message)
 
 
 def now() -> float:
