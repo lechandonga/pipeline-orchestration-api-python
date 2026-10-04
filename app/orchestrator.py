@@ -198,12 +198,16 @@ class Orchestrator:
             )
         return run
 
+    def get_run_snapshot(self, run_id: str) -> Run:
+        """Read-side accessor: always returns a detached consistent copy."""
+        return self.get_run(run_id).snapshot()
+
     def list_runs(self, pipeline_name: str | None = None) -> list[Run]:
         with self._lock:
             runs = list(self._runs.values())
         if pipeline_name is not None:
             runs = [r for r in runs if r.pipeline_name == pipeline_name]
-        return runs
+        return [run.snapshot() for run in runs]
 
     def query_runs(
         self,
@@ -322,7 +326,7 @@ class Orchestrator:
                 run.cond.wait_for(
                     lambda: run.state in _TERMINAL_RUN_STATES, timeout=timeout
                 )
-        return run
+        return run.snapshot()
 
     # ------------------------------------------------------------ cancellation
     def cancel_run(self, run_id: str) -> Run:
@@ -345,41 +349,70 @@ class Orchestrator:
         return run
 
     def _abort_run(self, run: Run, final_state: RunState, reason: str) -> None:
-        """Move a QUEUED/RUNNING run to a terminal state and converge tasks."""
+        """Move a QUEUED run to a terminal state, or request convergence of a
+        RUNNING run.
+
+        For a running run the terminal state is *not* published while tasks
+        are still executing. Instead the abort request is recorded, every
+        not-yet-started task becomes SKIPPED, and the scheduler lands the
+        terminal state only once all in-flight tasks have settled. Readers
+        therefore keep seeing RUNNING until the run is self-consistent.
+        """
         with run.cond:
-            if run.state in _TERMINAL_RUN_STATES:
+            if run.state in _TERMINAL_RUN_STATES or run.abort_target is not None:
                 raise RunNotCancellableError(
-                    f"run is already in terminal state {run.state.value}",
-                    details={"run_id": run.run_id, "state": run.state.value},
+                    f"run is already {run.state.value}"
+                    + (
+                        f" (aborting to {run.abort_target.value})"
+                        if run.abort_target is not None
+                        else ""
+                    ),
+                    details={
+                        "run_id": run.run_id,
+                        "state": run.state.value,
+                    },
                 )
             from_queue = run.state == RunState.QUEUED
-            run.state = final_state
-            run.failure_reason = reason
             run.cancel_event.set()
-            for task in run.tasks.values():
-                if task.state == TaskState.PENDING:
-                    task.state = TaskState.SKIPPED
-                    task.error = (
-                        "skipped: run cancelled while queued"
-                        if from_queue
-                        else f"skipped: run {final_state.value.lower()} before start"
-                    )
-                    task.finished_at = now()
             if from_queue:
+                run.state = final_state
+                run.failure_reason = reason
+                for task in run.tasks.values():
+                    if task.state == TaskState.PENDING:
+                        task.state = TaskState.SKIPPED
+                        task.error = (
+                            "skipped: run cancelled while queued"
+                            if final_state == RunState.CANCELLED
+                            else f"skipped: run {final_state.value.lower()} before start"
+                        )
+                        task.finished_at = now()
                 run.started_at = None
                 run.wall_started_at = None
                 run.finished_at = None
+                run.wall_finished_at = time.time()
+                run.cond.notify_all()
             else:
-                run.finished_at = now()
-            run.wall_finished_at = time.time()
-            run.cond.notify_all()
+                # Defer the visible terminal state until convergence.
+                run.abort_target = final_state
+                run.abort_reason = reason
+                for task in run.tasks.values():
+                    if task.state == TaskState.PENDING:
+                        task.state = TaskState.SKIPPED
+                        task.error = (
+                            f"skipped: run {final_state.value.lower()} before start"
+                        )
+                        task.finished_at = now()
+                run.cond.notify_all()
         if from_queue:
             with self._admission_cond:
                 self._admission_cond.notify()
 
     def _on_run_timeout(self, run: Run) -> None:
         with run.cond:
-            if run.state != RunState.RUNNING:
+            if (
+                run.state != RunState.RUNNING
+                or run.abort_target is not None
+            ):
                 return
             seconds = run.timeout_seconds
             reason = (
@@ -387,8 +420,11 @@ class Orchestrator:
                 if seconds is not None
                 else "run timed out"
             )
-        self._abort_run(run, RunState.FAILED, reason)
-        log.warning("run timed out run=%s", run.run_id)
+        try:
+            self._abort_run(run, RunState.FAILED, reason)
+        except RunNotCancellableError:
+            return
+        log.warning("run timeout requested run=%s", run.run_id)
 
     # -------------------------------------------------------------- scheduling
     def _schedule(self, run: Run, definition: PipelineDef) -> None:
@@ -407,33 +443,48 @@ class Orchestrator:
             while True:
                 ready: list[TaskDef] = []
                 with run.cond:
+                    abort = run.abort_target
                     if run.state != RunState.RUNNING:
                         break
-                    failed = any(
-                        t.state == TaskState.FAILED for t in run.tasks.values()
-                    )
-                    if failed:
-                        # Downstream tasks are forbidden from starting, but
-                        # unrelated in-flight branches must converge first so
-                        # the run never reports FAILED while tasks are RUNNING.
-                        self._propagate_skips(run, definition)
-                        if all(
-                            task.state in _TERMINAL_TASK_STATES
-                            for task in run.tasks.values()
-                        ):
-                            self._finish_locked(run, RunState.FAILED)
+                    if abort is not None:
+                        # A cancel/timeout was requested: no task may start,
+                        # no retry may be issued and no downstream unlocks.
+                        # Just drain the in-flight set, then land the
+                        # terminal state atomically with task convergence.
+                        if not in_flight:
+                            self._finish_locked(run, abort, run.abort_reason)
                             break
-                    # Launch tasks whose dependencies are settled. After a
-                    # failure, propagation above has removed every blocked
-                    # task from PENDING, so only healthy branches launch.
-                    for name in list(remaining):
-                        task_def = definition.tasks[name]
-                        if all(
-                            run.tasks[d].state in _TERMINAL_TASK_STATES
-                            for d in task_def.dependencies
-                        ):
-                            remaining.discard(name)
-                            ready.append(task_def)
+                    else:
+                        failed = any(
+                            t.state == TaskState.FAILED
+                            for t in run.tasks.values()
+                        )
+                        if failed:
+                            # Downstream tasks are forbidden from starting,
+                            # but unrelated in-flight branches must converge
+                            # first so the run never reports FAILED while
+                            # tasks are RUNNING.
+                            self._propagate_skips(run, definition)
+                            if all(
+                                task.state in _TERMINAL_TASK_STATES
+                                for task in run.tasks.values()
+                            ):
+                                self._finish_locked(run, RunState.FAILED)
+                                break
+                        # Launch tasks whose dependencies are settled.
+                        # Tasks flipped to SKIPPED by an abort are skipped
+                        # here, so an abort never launches a new task.
+                        for name in list(remaining):
+                            task_def = definition.tasks[name]
+                            if run.tasks[name].state != TaskState.PENDING:
+                                remaining.discard(name)
+                                continue
+                            if all(
+                                run.tasks[d].state in _TERMINAL_TASK_STATES
+                                for d in task_def.dependencies
+                            ):
+                                remaining.discard(name)
+                                ready.append(task_def)
                 for task_def in ready:
                     in_flight[task_def.name] = self._task_pool.submit(
                         self._run_task, run, definition, task_def
@@ -482,14 +533,15 @@ class Orchestrator:
         run.cond.notify_all()
 
     def _wait_settled(self, run: Run, timeout: float = 30.0) -> None:
-        """Block until every task has converged to a terminal state."""
+        """Block until the run is terminal, which is published only after
+        every task has converged to a terminal state."""
         with run.cond:
-            run.cond.wait_for(
-                lambda: all(
-                    task.state in _TERMINAL_TASK_STATES for task in run.tasks.values()
-                ),
-                timeout=timeout,
-            )
+            deadline = time.monotonic() + timeout
+            while run.state not in _TERMINAL_RUN_STATES:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                run.cond.wait(timeout=remaining)
 
     def _propagate_skips(self, run: Run, definition: PipelineDef) -> None:
         """Mark every not-yet-started downstream of a failed task SKIPPED."""
@@ -525,7 +577,11 @@ class Orchestrator:
         task = run.tasks[task_def.name]
         max_attempts = task_def.max_retries + 1
         with run.cond:
-            if run.state != RunState.RUNNING or task.state != TaskState.PENDING:
+            if (
+                run.state != RunState.RUNNING
+                or run.abort_target is not None
+                or task.state != TaskState.PENDING
+            ):
                 return
             task.state = TaskState.RUNNING
             task.started_at = now()
@@ -579,20 +635,21 @@ class Orchestrator:
                     exc,
                 )
                 with run.cond:
-                    # The run may have converged to a terminal state while we
-                    # were logging; re-check under the lock.
-                    aborted_state = run.state
-                    if aborted_state != RunState.RUNNING:
-                        # The run was cancelled or timed out mid-attempt.
-                        # Cancellation converges an interrupted in-flight
-                        # task to CANCELLED (historic behavior); a run-level
-                        # timeout counts as a failure, never as success.
+                    # The run may have been aborted (cancel/timeout) while we
+                    # were executing; re-check under the lock. The timed-out
+                    # attempt is already booked FAILED above and is never
+                    # retried.
+                    abort = run.abort_target
+                    if run.state != RunState.RUNNING or abort is not None:
                         task.state = (
                             TaskState.CANCELLED
-                            if aborted_state == RunState.CANCELLED
+                            if abort == RunState.CANCELLED
                             else TaskState.FAILED
                         )
-                        task.error = f"{run.failure_reason or 'run aborted'}: {last_error}"
+                        task.error = (
+                            f"{run.abort_reason or run.failure_reason or 'run aborted'}"
+                            f": {last_error}"
+                        )
                         task.finished_at = now()
                         run.cond.notify_all()
                         return
@@ -628,21 +685,24 @@ class Orchestrator:
                 record.status = "SUCCEEDED"
                 record.finished_at = now()
                 with run.cond:
-                    aborted_state = run.state
-                    if aborted_state != RunState.RUNNING:
-                        # Finished at the instant the run was aborted. Do not
-                        # book it as success against a dead run; converge to
-                        # the state matching the abort cause.
+                    abort = run.abort_target
+                    if run.state != RunState.RUNNING or abort is not None:
+                        # Finished at the instant the run was aborted (or
+                        # while it was converging). Do not book it as
+                        # success against an aborted run; converge to the
+                        # state matching the abort cause.
                         record.status = "FAILED"
-                        record.error = run.failure_reason or "run aborted"
+                        record.error = (
+                            run.abort_reason or run.failure_reason or "run aborted"
+                        )
                         record.finished_at = now()
                         task.state = (
                             TaskState.CANCELLED
-                            if aborted_state == RunState.CANCELLED
+                            if abort == RunState.CANCELLED
                             else TaskState.FAILED
                         )
                         task.error = "aborted after last attempt finished: " + (
-                            run.failure_reason or "run aborted"
+                            run.abort_reason or run.failure_reason or "run aborted"
                         )
                         task.finished_at = now()
                         run.cond.notify_all()

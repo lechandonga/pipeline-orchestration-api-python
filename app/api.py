@@ -139,7 +139,7 @@ def _register_routes(app: FastAPI) -> None:
     @app.get("/runs/{run_id}")
     def get_run(request: Request, run_id: str):
         try:
-            run = _orch(request).get_run(run_id)
+            run = _orch(request).get_run_snapshot(run_id)
         except OrchestrationError as exc:
             _raise(exc)
         return run_to_dict(run)
@@ -201,7 +201,7 @@ def _register_routes(app: FastAPI) -> None:
             run = _orch(request).cancel_run(run_id)
             # Converge: wait for in-flight tasks before responding.
             _orch(request)._wait_settled(run, timeout=30)
-            run = _orch(request).get_run(run_id)
+            run = _orch(request).get_run_snapshot(run_id)
         except OrchestrationError as exc:
             _raise(exc)
         return run_to_dict(run)

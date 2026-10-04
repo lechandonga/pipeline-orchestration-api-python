@@ -92,6 +92,12 @@ class Run:
     wall_finished_at: float | None = None
     timeout_seconds: float | None = None
     failure_reason: str | None = None
+    # While an abort (cancel or run-level timeout) is converging in-flight
+    # tasks the run stays RUNNING externally; these fields describe the
+    # terminal state that will be published once every task has settled, so
+    # no reader can ever observe a terminal run alongside RUNNING tasks.
+    abort_target: RunState | None = None
+    abort_reason: str | None = None
     sequence: int = 0
     cancel_event: threading.Event = field(default_factory=threading.Event)
     lock: threading.RLock = field(default_factory=threading.RLock)

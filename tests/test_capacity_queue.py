@@ -64,7 +64,7 @@ def test_runs_beyond_capacity_are_queued(client, helpers, orchestrator):
 
 
 @pytest.mark.business("容量排队-FIFO顺序执行不饿死")
-def test_queue_is_fifo_without_starvation(client, helpers):
+def test_queue_is_fifo_without_starvation(client, helpers, orchestrator):
     payload = {
         "name": "fifo",
         "tasks": [
@@ -72,6 +72,9 @@ def test_queue_is_fifo_without_starvation(client, helpers):
         ],
     }
     helpers.submit(client, payload)
+    # 容量限制为 1：每次只有一个运行在执行，后续运行严格排队，准入顺序
+    # 必然等于触发顺序（FIFO），不依赖完成先后的观察时机。
+    orchestrator.max_concurrent_runs = 1
     ids = [
         client.post("/pipelines/fifo/runs", json={}).json()["run_id"]
         for _ in range(5)
@@ -79,16 +82,26 @@ def test_queue_is_fifo_without_starvation(client, helpers):
     order: list[str] = []
     done: set[str] = set()
     deadline = time.time() + 15
+    admitted: list[str] = []
+    seen_running: set[str] = set()
     while time.time() < deadline and len(done) < 5:
         for run_id in ids:
+            run = client.get(f"/runs/{run_id}").json()
+            if (
+                run["state"] == "RUNNING"
+                and run_id not in seen_running
+            ):
+                seen_running.add(run_id)
+                admitted.append(run_id)
             if run_id in done:
                 continue
-            run = client.get(f"/runs/{run_id}").json()
             if run["state"] == "SUCCEEDED":
                 order.append(run_id)
                 done.add(run_id)
         time.sleep(0.02)
-    assert order == ids
+    assert len(order) == 5
+    assert admitted == ids  # 准入顺序即 FIFO
+    assert order == ids  # 容量 1 下完成顺序同样等于准入顺序
 
 
 @pytest.mark.business("排队取消-一个任务都不启动")

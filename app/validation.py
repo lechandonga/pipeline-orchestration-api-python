@@ -257,13 +257,19 @@ class DefinitionRegistry:
             candidate = build_definition(
                 normalized_payload, version=len(existing) + 1
             )
-            if existing and self._same_graph(existing[-1], candidate):
-                return SubmissionResult(
-                    name=candidate.name,
-                    version=existing[-1].version,
-                    reused=True,
-                    definition=existing[-1],
-                )
+            # Match against EVERY published version, not only the latest:
+            # resubmitting v1's exact content after v2 was published (a
+            # rollback) must reuse the earliest matching version. The whole
+            # check-then-create runs under one lock, so concurrent identical
+            # submissions resolve to that single existing version.
+            for published in existing:
+                if self._same_graph(published, candidate):
+                    return SubmissionResult(
+                        name=candidate.name,
+                        version=published.version,
+                        reused=True,
+                        definition=published,
+                    )
             self._versions.setdefault(candidate.name, []).append(candidate)
             return SubmissionResult(
                 name=candidate.name,
