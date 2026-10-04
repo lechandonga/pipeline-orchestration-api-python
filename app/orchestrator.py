@@ -345,15 +345,28 @@ class Orchestrator:
         return run
 
     def _abort_run(self, run: Run, final_state: RunState, reason: str) -> None:
-        """Move a QUEUED/RUNNING run to a terminal state and converge tasks."""
+        """Request a terminal state and converge all of a run's tasks.
+
+        A QUEUED run has never started anything: it reaches the terminal
+        state immediately. A RUNNING run stays publicly RUNNING until every
+        in-flight task has converged -- the abort is recorded as the pending
+        final state, ``cancel_event`` interrupts running actions, and the
+        scheduler publishes the terminal state only after the last task
+        settles. The first abort wins, so cancellation and timeout can never
+        overwrite each other's outcome or reason.
+        """
         with run.cond:
             if run.state in _TERMINAL_RUN_STATES:
                 raise RunNotCancellableError(
                     f"run is already in terminal state {run.state.value}",
                     details={"run_id": run.run_id, "state": run.state.value},
                 )
+            if run.pending_final_state is not None:
+                # An abort (cancel or timeout) is already converging; report
+                # that same outcome instead of racing it.
+                return
             from_queue = run.state == RunState.QUEUED
-            run.state = final_state
+            run.pending_final_state = final_state
             run.failure_reason = reason
             run.cancel_event.set()
             for task in run.tasks.values():
@@ -366,12 +379,12 @@ class Orchestrator:
                     )
                     task.finished_at = now()
             if from_queue:
+                run.state = final_state
+                run.pending_final_state = None
                 run.started_at = None
                 run.wall_started_at = None
                 run.finished_at = None
-            else:
-                run.finished_at = now()
-            run.wall_finished_at = time.time()
+                run.wall_finished_at = time.time()
             run.cond.notify_all()
         if from_queue:
             with self._admission_cond:
@@ -379,7 +392,14 @@ class Orchestrator:
 
     def _on_run_timeout(self, run: Run) -> None:
         with run.cond:
-            if run.state != RunState.RUNNING:
+            if (
+                run.state != RunState.RUNNING
+                or run.pending_final_state is not None
+                or all(
+                    task.state in _TERMINAL_TASK_STATES
+                    for task in run.tasks.values()
+                )
+            ):
                 return
             seconds = run.timeout_seconds
             reason = (
@@ -387,7 +407,18 @@ class Orchestrator:
                 if seconds is not None
                 else "run timed out"
             )
-        self._abort_run(run, RunState.FAILED, reason)
+            # Request the abort while holding the same condition the
+            # scheduler uses for state transitions, so a run finishing at
+            # the timeout instant is resolved deterministically.
+            run.pending_final_state = RunState.FAILED
+            run.failure_reason = reason
+            run.cancel_event.set()
+            for task in run.tasks.values():
+                if task.state == TaskState.PENDING:
+                    task.state = TaskState.SKIPPED
+                    task.error = "skipped: run failed before start"
+                    task.finished_at = now()
+            run.cond.notify_all()
         log.warning("run timed out run=%s", run.run_id)
 
     # -------------------------------------------------------------- scheduling
@@ -407,9 +438,8 @@ class Orchestrator:
             while True:
                 ready: list[TaskDef] = []
                 with run.cond:
-                    if run.state != RunState.RUNNING:
-                        break
-                    failed = any(
+                    abort = run.pending_final_state
+                    failed = abort == RunState.FAILED or any(
                         t.state == TaskState.FAILED for t in run.tasks.values()
                     )
                     if failed:
@@ -417,23 +447,33 @@ class Orchestrator:
                         # unrelated in-flight branches must converge first so
                         # the run never reports FAILED while tasks are RUNNING.
                         self._propagate_skips(run, definition)
-                        if all(
-                            task.state in _TERMINAL_TASK_STATES
-                            for task in run.tasks.values()
-                        ):
-                            self._finish_locked(run, RunState.FAILED)
-                            break
-                    # Launch tasks whose dependencies are settled. After a
-                    # failure, propagation above has removed every blocked
-                    # task from PENDING, so only healthy branches launch.
-                    for name in list(remaining):
-                        task_def = definition.tasks[name]
-                        if all(
-                            run.tasks[d].state in _TERMINAL_TASK_STATES
-                            for d in task_def.dependencies
-                        ):
-                            remaining.discard(name)
-                            ready.append(task_def)
+                    settled = all(
+                        task.state in _TERMINAL_TASK_STATES
+                        for task in run.tasks.values()
+                    )
+                    if settled:
+                        final_state = abort or (
+                            RunState.FAILED if failed else RunState.SUCCEEDED
+                        )
+                        self._finish_locked(run, final_state)
+                        break
+                    if abort is not None:
+                        # Aborting: no new attempts may launch; just wait for
+                        # the remaining in-flight tasks to converge.
+                        ready = []
+                    else:
+                        # Launch tasks whose dependencies are settled. After
+                        # a failure, propagation above has removed every
+                        # blocked task from PENDING, so only healthy branches
+                        # launch.
+                        for name in list(remaining):
+                            task_def = definition.tasks[name]
+                            if all(
+                                run.tasks[d].state in _TERMINAL_TASK_STATES
+                                for d in task_def.dependencies
+                            ):
+                                remaining.discard(name)
+                                ready.append(task_def)
                 for task_def in ready:
                     in_flight[task_def.name] = self._task_pool.submit(
                         self._run_task, run, definition, task_def
@@ -452,8 +492,10 @@ class Orchestrator:
                     in_flight.pop(name)
                     future.result()  # surface unexpected worker errors
             with run.cond:
-                if run.state == RunState.RUNNING:
-                    self._finish_locked(run, RunState.SUCCEEDED)
+                if run.state not in _TERMINAL_RUN_STATES:
+                    self._finish_locked(
+                        run, run.pending_final_state or RunState.SUCCEEDED
+                    )
         except Exception:  # pragma: no cover - defensive
             log.exception("scheduler crashed run=%s", run.run_id)
             with run.cond:
@@ -474,22 +516,15 @@ class Orchestrator:
     def _finish_locked(
         run: Run, state: RunState, reason: str | None = None
     ) -> None:
+        if run.pending_final_state is not None:
+            state = run.pending_final_state
         run.state = state
+        run.pending_final_state = None
         if reason is not None:
             run.failure_reason = reason
         run.finished_at = now()
         run.wall_finished_at = time.time()
         run.cond.notify_all()
-
-    def _wait_settled(self, run: Run, timeout: float = 30.0) -> None:
-        """Block until every task has converged to a terminal state."""
-        with run.cond:
-            run.cond.wait_for(
-                lambda: all(
-                    task.state in _TERMINAL_TASK_STATES for task in run.tasks.values()
-                ),
-                timeout=timeout,
-            )
 
     def _propagate_skips(self, run: Run, definition: PipelineDef) -> None:
         """Mark every not-yet-started downstream of a failed task SKIPPED."""
@@ -525,7 +560,10 @@ class Orchestrator:
         task = run.tasks[task_def.name]
         max_attempts = task_def.max_retries + 1
         with run.cond:
-            if run.state != RunState.RUNNING or task.state != TaskState.PENDING:
+            if (
+                run.pending_final_state is not None
+                or task.state != TaskState.PENDING
+            ):
                 return
             task.state = TaskState.RUNNING
             task.started_at = now()
@@ -557,14 +595,35 @@ class Orchestrator:
             )
             try:
                 self.executor.execute(ctx, task_def.action)
-                # An action that ignores its deadline must never look like a
-                # success: a timeout is an attempt failure, full stop.
-                if deadline is not None and now() > deadline:
-                    raise TaskTimeoutError(
-                        f"task '{task_def.name}' attempt timed out after "
-                        f"{task_def.timeout_seconds:.3f}s"
-                    )
             except TaskFailure as exc:
+                # A run-level abort interrupts sleeping actions via the
+                # cancel event; that interruption must follow the run's
+                # outcome (timeout -> failure, cancel -> cancelled), and it
+                # must not consume the task's own retry budget or get booked
+                # as a task timeout.
+                with run.cond:
+                    abort = run.pending_final_state
+                if abort is not None:
+                    record.status = "FAILED"
+                    record.error = run.failure_reason or "run aborted"
+                    record.finished_at = now()
+                    with run.cond:
+                        task.state = (
+                            TaskState.CANCELLED
+                            if abort == RunState.CANCELLED
+                            else TaskState.FAILED
+                        )
+                        task.error = f"{run.failure_reason or 'run aborted'}: {exc}"
+                        task.finished_at = now()
+                        run.cond.notify_all()
+                    log.warning(
+                        "task attempt aborted run=%s task=%s attempt=%d outcome=%s",
+                        run.run_id,
+                        task_def.name,
+                        attempt_no,
+                        task.state.value,
+                    )
+                    return
                 timed_out = isinstance(exc, TaskTimeoutError)
                 record.status = "FAILED"
                 record.error = str(exc)
@@ -575,28 +634,27 @@ class Orchestrator:
                     "timed out" if timed_out else "failed",
                     run.run_id,
                     task_def.name,
-                    attempt_no,
-                    exc,
-                )
-                with run.cond:
-                    # The run may have converged to a terminal state while we
-                    # were logging; re-check under the lock.
-                    aborted_state = run.state
-                    if aborted_state != RunState.RUNNING:
-                        # The run was cancelled or timed out mid-attempt.
-                        # Cancellation converges an interrupted in-flight
-                        # task to CANCELLED (historic behavior); a run-level
-                        # timeout counts as a failure, never as success.
-                        task.state = (
-                            TaskState.CANCELLED
-                            if aborted_state == RunState.CANCELLED
-                            else TaskState.FAILED
-                        )
-                        task.error = f"{run.failure_reason or 'run aborted'}: {last_error}"
-                        task.finished_at = now()
-                        run.cond.notify_all()
-                        return
+                        attempt_no,
+                        exc,
+                    )
                 if attempt_no < max_attempts:
+                    with run.cond:
+                        abort = run.pending_final_state
+                    if abort is not None:
+                        # The run was cancelled/timed out between attempts:
+                        # no further attempt may be launched.
+                        with run.cond:
+                            task.state = (
+                                TaskState.CANCELLED
+                                if abort == RunState.CANCELLED
+                                else TaskState.FAILED
+                            )
+                            task.error = (
+                                f"{run.failure_reason or 'run aborted'}: {last_error}"
+                            )
+                            task.finished_at = now()
+                            run.cond.notify_all()
+                        return
                     continue
                 with run.cond:
                     task.state = TaskState.FAILED
@@ -625,11 +683,46 @@ class Orchestrator:
                     run.cond.notify_all()
                 return
             else:
+                # An action that ignores its deadline must never look like a
+                # success: a task timeout is an attempt failure, full stop.
+                over_deadline = deadline is not None and now() > deadline
+                with run.cond:
+                    abort = run.pending_final_state
+                if over_deadline:
+                    record.status = "FAILED"
+                    record.error = (
+                        f"task '{task_def.name}' attempt timed out after "
+                        f"{task_def.timeout_seconds:.3f}s"
+                    )
+                    record.finished_at = now()
+                    timeout_error = TaskTimeoutError(record.error)
+                    if abort is not None:
+                        with run.cond:
+                            task.state = (
+                                TaskState.CANCELLED
+                                if abort == RunState.CANCELLED
+                                else TaskState.FAILED
+                            )
+                            task.error = (
+                                f"{run.failure_reason or 'run aborted'}: {record.error}"
+                            )
+                            task.finished_at = now()
+                            run.cond.notify_all()
+                        return
+                    if attempt_no < max_attempts:
+                        continue
+                    with run.cond:
+                        task.state = TaskState.FAILED
+                        task.error = (
+                            f"timed out after {attempt_no} attempt(s): {record.error}"
+                        )
+                        task.finished_at = now()
+                        run.cond.notify_all()
+                    return
                 record.status = "SUCCEEDED"
                 record.finished_at = now()
                 with run.cond:
-                    aborted_state = run.state
-                    if aborted_state != RunState.RUNNING:
+                    if abort is not None:
                         # Finished at the instant the run was aborted. Do not
                         # book it as success against a dead run; converge to
                         # the state matching the abort cause.
@@ -638,7 +731,7 @@ class Orchestrator:
                         record.finished_at = now()
                         task.state = (
                             TaskState.CANCELLED
-                            if aborted_state == RunState.CANCELLED
+                            if abort == RunState.CANCELLED
                             else TaskState.FAILED
                         )
                         task.error = "aborted after last attempt finished: " + (

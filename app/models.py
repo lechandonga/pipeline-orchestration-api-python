@@ -93,6 +93,12 @@ class Run:
     timeout_seconds: float | None = None
     failure_reason: str | None = None
     sequence: int = 0
+    # Set when a RUNNING run is cancelled/timed out. The run keeps publicly
+    # reporting RUNNING (and cancel_event interrupts in-flight tasks) until
+    # every task has converged; only then does the scheduler publish this
+    # state. Readers therefore can never observe a terminal run alongside a
+    # still-RUNNING task.
+    pending_final_state: RunState | None = None
     cancel_event: threading.Event = field(default_factory=threading.Event)
     lock: threading.RLock = field(default_factory=threading.RLock)
     cond: threading.Condition = field(init=False)

@@ -88,9 +88,19 @@ uv run uvicorn main:app --reload
   超时绝不会被记成成功。
 - **运行级超时**：触发时传 `run_timeout_seconds`。超时后运行立即判为
   `FAILED`，`failure_reason` 为 `run exceeded timeout of Xs`：尚未开始的
-  任务不再启动并标记 `SKIPPED`，正在执行的任务被中断并收敛为 `FAILED`，
-  调度器等待全部在途任务收敛后才落终态，不会出现“运行已失败但任务还在
-  RUNNING”。
+  任务不再启动并标记 `SKIPPED`，正在执行的任务被中断并收敛为 `FAILED`。
+  **收敛期间运行对外仍显示 `RUNNING`**，直到全部在途任务都进入终态后，
+  运行才一次性发布 `FAILED` 终态；因此等待接口、运行详情、运行列表、
+  统计等任何读接口，在任何时刻都不会看到“运行已失败但任务还在
+  RUNNING/PENDING”的自相矛盾记录，同一份运行反复查询结论一致。被中断
+  的在途尝试记为该次尝试 `FAILED`，**不记成功、不消耗重试预算、不补发
+  新尝试**，其下游也不会被解锁启动。
+- **取消与超时的区分**：取消收敛为 `CANCELLED`，在途任务收敛到
+  `CANCELLED`，`failure_reason` 为 `run cancelled`（排队中取消为
+  `cancelled while queued: no task was started`）；整体超时收敛为
+  `FAILED`，在途任务收敛到 `FAILED`，`failure_reason` 含
+  `exceeded timeout`。两类终态与原因始终可区分；先到的中止原因生效，
+  超时与取消不会互相覆盖。
 - **未配置任何超时的流程行为与旧版完全一致**：没有截止时间，动作不被
   提前打断。
 
@@ -121,8 +131,12 @@ PENDING ──> RUNNING ──> SUCCEEDED
   已处于终态的运行再次取消返回 `409 RUN_NOT_CANCELLABLE`。
 - 排队中取消：不经过 RUNNING，直接 `QUEUED -> CANCELLED`，任务全部
   SKIPPED、尝试次数为 0。
-- 运行整体超时：`RUNNING -> FAILED`，原因写入 `failure_reason`；在途
-  任务收敛为 FAILED，未开始任务 SKIPPED。
+- 运行整体超时：先在内部挂起失败结论并中断在途任务（对外仍为
+  `RUNNING`），待全部任务收敛后一次性发布 `RUNNING -> FAILED`，原因
+  写入 `failure_reason`；在途任务收敛为 FAILED（当次尝试 FAILED、不
+  重试、不记成功），未开始任务 SKIPPED。任何读接口都观察不到“运行已
+  失败而任务仍在 RUNNING/PENDING”的中间状态。取消与超时的终态
+  （CANCELLED vs FAILED）及原因始终可区分。
 
 ## 幂等约定
 
@@ -188,11 +202,18 @@ PENDING ──> RUNNING ──> SUCCEEDED
 
 ## 版本兼容范围
 
-- 定义发布后不可修改：重复提交相同图结构返回同一版本（`reused=true`），
-  图有任何变化（任务、依赖、动作、重试配置、超时配置）则生成递增新版本。
+- 定义发布后不可修改：提交时会把新定义与该流程**历史上的每一个版本**
+  逐一比对，只要任务、依赖、动作、重试配置、任务/默认超时配置与任一
+  历史版本完全相同，就复用那个版本号并返回 `reused=true`——**包括回退
+  重发更早的历史版本**（例如已发布 v1、v2、v3 后，把 v1 的内容原样
+  重发，得到的仍是 v1，不会生出内容重复的 v4）；只有与所有历史版本
+  都不同时才生成递增新版本。
 - 流程名提交时自动去除前后空格：`"etl"`、`" etl "` 视为同一个流程；
   版本号始终连续唯一（1, 2, 3 ...），相同定义（含带空格的名字）重复
   提交仍复用原版本号。
+- 多人/多线程同时提交同一份定义时，比对与入库在同一个锁内原子完成，
+  只会产生一个版本：所有并发提交都拿到同一个版本号，且除入库的那次
+  外均返回 `reused=true`。
 - 每个运行在创建时固化定义快照（响应中的 `version`），历史运行永远按
   发起时的版本解释与展示；之后提交新版本不改变旧运行的任何结论。
 - 发起运行时可用 `version` 显式指定历史版本；不指定则使用最新版本。
@@ -221,7 +242,8 @@ uv run pytest                 # 运行全部单测
 uv run pytest -q              # 安静模式，末尾打印“业务覆盖汇总”
 uv run pytest -k 取消          # 只跑取消相关业务
 uv run pytest tests/test_capacity_queue.py tests/test_timeouts.py \
-               tests/test_history_stats.py tests/test_submission_boundaries.py
+               tests/test_history_stats.py tests/test_submission_boundaries.py \
+               tests/test_version_reuse_timeout_convergence.py
 ```
 
 手工复现 CI 批量并发与排队（默认容量 8）：
@@ -260,9 +282,24 @@ curl -s -X POST localhost:8000/pipelines/tt/runs -H 'content-type: application/j
 curl -s localhost:8000/pipelines -H 'content-type: application/json' -d '{
   "name":"rt","tasks":[{"name":"a","dependencies":[],
   "action":{"type":"sleep","seconds":5}},
-  {"name":"b","dependencies":["a"],"action":{"type":"succeed"}}]}'
+  {"name":"b","dependencies":[],"action":{"type":"sleep","seconds":5}},
+  {"name":"c","dependencies":["a","b"],"action":{"type":"succeed"}}]}'
 curl -s -X POST localhost:8000/pipelines/rt/runs -H 'content-type: application/json' \
-  -d '{"run_timeout_seconds":0.2,"wait":true,"wait_timeout":10}'
+  -d '{"run_timeout_seconds":0.2}'
+# 超时前后高频轮询：收敛期间只可能看到 RUNNING（任务可能在跑），
+# 一旦 FAILED，所有任务必然已是 FAILED/SKIPPED，不会出现矛盾记录
+RID=<run_id>
+for i in $(seq 1 20); do curl -s localhost:8000/runs/$RID; sleep 0.05; done
+
+# 回退重发历史版本：先发 v1、v2，再把 v1 原样（名字可带空格）重发，
+# 返回 version=1、reused=true，版本列表仍只有 1、2
+curl -s localhost:8000/pipelines -H 'content-type: application/json' \
+  -d '{"name":"etl","tasks":[{"name":"a","dependencies":[],"action":{"type":"succeed"}}]}'
+curl -s localhost:8000/pipelines -H 'content-type: application/json' \
+  -d '{"name":"etl","tasks":[{"name":"a","dependencies":[],"action":{"type":"fail"}}]}'
+curl -s localhost:8000/pipelines -H 'content-type: application/json' \
+  -d '{"name":"  etl  ","tasks":[{"name":"a","dependencies":[],"action":{"type":"succeed"}}]}'
+curl -s localhost:8000/pipelines/etl/versions
 ```
 
 验证查询与统计：
@@ -285,6 +322,10 @@ curl -s 'localhost:8000/runs-stats'
   重试记录、失败传播、成功任务不重复记账、跨版本历史结论稳定性、
   批量并发收敛（40 个运行）、容量排队可见性、FIFO 不饿死、排队取消
   不启动任务、压测后可接新触发、排队幂等、任务级超时（重试/失败传播/
-  不记成功）、运行级超时（未开始不启动、在途收敛、原因明确）、无超时
-  兼容旧行为、提交名称空白归一、版本连续唯一、相同定义复用版本、
-  历史过滤分页不重不漏、统计与明细对账、平均耗时、上百运行查询性能。
+  不记成功）、运行级超时（未开始不启动、在途收敛、原因明确）、多在途
+  任务超时收敛时详情/列表/等待各读接口全程一致无矛盾、超时不补发
+  重试不解锁下游、取消与超时终态原因可区分、排队取消不启动任务、
+  无超时兼容旧行为、提交名称空白归一、版本连续唯一、相同定义复用
+  版本（跨版本回退重发、重试/超时配置参与比对、并发重复提交只得
+  一个版本）、历史过滤分页不重不漏、统计与明细对账、平均耗时、
+  上百运行查询性能。

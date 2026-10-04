@@ -198,10 +198,11 @@ def _register_routes(app: FastAPI) -> None:
     @app.post("/runs/{run_id}/cancel", status_code=200)
     def cancel_run(request: Request, run_id: str):
         try:
-            run = _orch(request).cancel_run(run_id)
-            # Converge: wait for in-flight tasks before responding.
-            _orch(request)._wait_settled(run, timeout=30)
-            run = _orch(request).get_run(run_id)
+            _orch(request).cancel_run(run_id)
+            # Converge: the run keeps reporting its pre-terminal state until
+            # every in-flight task settles, so wait for the real terminal
+            # state before responding.
+            run = _orch(request).wait_for(run_id, timeout=30)
         except OrchestrationError as exc:
             _raise(exc)
         return run_to_dict(run)

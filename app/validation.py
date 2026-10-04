@@ -257,13 +257,19 @@ class DefinitionRegistry:
             candidate = build_definition(
                 normalized_payload, version=len(existing) + 1
             )
-            if existing and self._same_graph(existing[-1], candidate):
-                return SubmissionResult(
-                    name=candidate.name,
-                    version=existing[-1].version,
-                    reused=True,
-                    definition=existing[-1],
-                )
+            # Reuse must match *any* historical version, not only the latest:
+            # rolling a definition back to an older payload resubmits that
+            # older version instead of creating a content-duplicate one. The
+            # registry lock makes the check-and-append atomic for concurrent
+            # submissions, so identical parallel payloads get one version.
+            for prior in existing:
+                if self._same_graph(prior, candidate):
+                    return SubmissionResult(
+                        name=candidate.name,
+                        version=prior.version,
+                        reused=True,
+                        definition=prior,
+                    )
             self._versions.setdefault(candidate.name, []).append(candidate)
             return SubmissionResult(
                 name=candidate.name,
